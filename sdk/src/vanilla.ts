@@ -105,8 +105,9 @@ export class InvisibleWallet {
 
     async register(username?: string): Promise<RegisterResult> {
         const challenge = crypto.getRandomValues(new Uint8Array(32));
-        const name = username || 'Veil User';
-        const userId = username ? new TextEncoder().encode(username) : crypto.getRandomValues(new Uint8Array(16));
+        const normalizedUsername = username ? username.normalize('NFC') : undefined;
+        const name = normalizedUsername || 'Veil User';
+        const userId = normalizedUsername ? new TextEncoder().encode(normalizedUsername) : crypto.getRandomValues(new Uint8Array(16));
 
         const credential = await navigator.credentials.create({
             publicKey: {
@@ -222,13 +223,6 @@ export class InvisibleWallet {
             throw new Error('No credential found. Call register() first.');
         }
 
-        const challenge = bufferToHex(signaturePayload);
-        const clientDataJSON = JSON.stringify({
-            type: 'webauthn.get',
-            challenge: btoa(String.fromCharCode(...signaturePayload)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, ''),
-            origin: this.config.origin || window.location.origin,
-        });
-
         const credentialIdBytes = hexToUint8Array(credentialIdHex);
         const assertion = await navigator.credentials.get({
             publicKey: {
@@ -250,7 +244,7 @@ export class InvisibleWallet {
         return {
             publicKey: hexToUint8Array(publicKeyHex) as Uint8Array,
             authData: new Uint8Array(response.authenticatorData) as Uint8Array,
-            clientDataJSON: new TextEncoder().encode(clientDataJSON) as Uint8Array,
+            clientDataJSON: new Uint8Array(response.clientDataJSON) as Uint8Array,
             signature: rawSignature as Uint8Array,
         };
     }

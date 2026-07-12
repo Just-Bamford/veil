@@ -22,6 +22,7 @@ import { sweepContractBalance } from '@/lib/sweepContractBalance'
 import { derToRawSignature, hexToUint8Array } from '@veil/utils'
 import type { WebAuthnSignature } from '@veil/sdk'
 import { getDueSchedules, updateSchedule, advanceNextRun, type PaymentSchedule } from '@/lib/schedules'
+import { useActivityFeed, initActivityFeed, hydrateActivityFeed, appendActivityFeed } from '@/lib/activityFeed'
 
 const network = getNetwork()
 
@@ -33,14 +34,72 @@ export interface WalletAsset {
   balance: string
 }
 
+// ── Shared types ─────────────────────────────────────────────────────────────
+
+type HorizonOp = {
+  id: string; type: string
+  from?: string; to?: string; funder?: string; account?: string
+  amount?: string; starting_balance?: string
+  asset_type?: string; asset_code?: string; asset_issuer?: string
+  source_amount?: string
+  source_asset_type?: string; source_asset_code?: string
+  created_at: string; transaction_hash: string
+  transaction?: { memo?: string }
+}
+
+type WraithTransfer = {
+  id: number; eventType: string; fromAddress: string | null
+  toAddress: string | null; amount: string; ledger: number
+  ledgerClosedAt: string; txHash: string; contractId: string
+}
+
+type WraithPage = { transfers: WraithTransfer[], next_cursor?: string | null }
+
+function mapHorizonOps(ops: HorizonOp[], signerPublicKey: string): import('@/components/TxDetailSheet').TxRecord[] {
+  return ops
+    .filter(p => p.type === 'payment' || p.type === 'create_account' || p.type === 'path_payment_strict_send')
+    .map(p => {
+      if (p.type === 'create_account') {
+        return {
+          id: p.id, type: 'received' as const,
+          amount: p.starting_balance ?? '0', asset: 'XLM',
+          counterparty: p.funder ?? 'Friendbot',
+          timestamp: Math.floor(new Date(p.created_at).getTime() / 1000),
+          hash: p.transaction_hash,
+        }
+      }
+      if (p.type === 'path_payment_strict_send') {
+        const srcAsset = p.source_asset_type === 'native' ? 'XLM' : (p.source_asset_code ?? 'XLM')
+        const dstAsset = p.asset_type === 'native' ? 'XLM' : (p.asset_code ?? '')
+        return {
+          id: p.id, type: 'swapped' as const,
+          amount: p.source_amount ?? '0', asset: srcAsset,
+          destAmount: p.amount ?? '0', destAsset: dstAsset,
+          counterparty: 'Stellar DEX',
+          timestamp: Math.floor(new Date(p.created_at).getTime() / 1000),
+          hash: p.transaction_hash,
+        }
+      }
+      return {
+        id: p.id,
+        type: p.from === signerPublicKey ? 'sent' as const : 'received' as const,
+        amount: p.amount ?? '0',
+        asset: p.asset_type === 'native' ? 'XLM' : (p.asset_code ?? ''),
+        counterparty: p.from === signerPublicKey ? (p.to ?? '') : (p.from ?? ''),
+        timestamp: Math.floor(new Date(p.created_at).getTime() / 1000),
+        hash: p.transaction_hash,
+        memo: p.transaction?.memo,
+      }
+    })
+}
+
 // ── Module-level cache ────────────────────────────────────────────────────────
 // Survives component unmount/remount within the SPA so navigating away and
 // back doesn't flash the skeleton state. Cleared on hard refresh (intentional).
 // Refetch still happens in the background to keep data fresh.
-let cachedAssets:       WalletAsset[]                 | null = null
-let cachedTransactions: TxRecord[]                    | null = null
-let cachedContractXlm:  number                        | null = null
-let cachedPrices:       Record<string, number | null>        = {}
+let cachedAssets:      WalletAsset[]                 | null = null
+let cachedContractXlm: number                        | null = null
+let cachedPrices:      Record<string, number | null>        = {}
 
 // ── Dashboard page ────────────────────────────────────────────────────────────
 function DashboardPageContent() {
@@ -50,7 +109,7 @@ function DashboardPageContent() {
 
   const [walletAddress, setWalletAddress] = useState<string | null>(null)
   const [assets, setAssets]               = useState<WalletAsset[]>(() => cachedAssets ?? [])
-  const [transactions, setTransactions]   = useState<TxRecord[]>(() => cachedTransactions ?? [])
+  const transactions                      = useActivityFeed()
   const [selectedTx, setSelectedTx]       = useState<TxRecord | null>(null)
   const [txFilter, setTxFilter]           = useState<'all' | 'transfers' | 'swaps'>('all')
   const [loading, setLoading]             = useState(cachedAssets === null)
@@ -67,6 +126,11 @@ function DashboardPageContent() {
   const [showConnectDapp, setShowConnectDapp] = useState(false)
   const [connectToast, setConnectToast] = useState<string | null>(null)
   const [sep24Modal, setSep24Modal] = useState<'deposit' | 'withdraw' | null>(null)
+  const [wraithInCursor, setWraithInCursor]   = useState<string | null>(null)
+  const [wraithOutCursor, setWraithOutCursor] = useState<string | null>(null)
+  const [hasMorePages, setHasMorePages]       = useState(false)
+  const [isLoadingMore, setIsLoadingMore]     = useState(false)
+  const horizonNextRef = useRef<(() => Promise<any>) | null>(null)
 
   useEffect(() => {
     const stored = sessionStorage.getItem('invisible_wallet_address')
@@ -83,9 +147,11 @@ function DashboardPageContent() {
 
   const fetchData = useCallback(async () => {
     if (!walletAddress) return   // keep loading=true until address is ready
-    // Only show skeleton if we have NO cached data — otherwise refetch silently
-    // in the background and update once the new data arrives.
     if (cachedAssets === null) setLoading(true)
+    horizonNextRef.current = null
+    setWraithInCursor(null)
+    setWraithOutCursor(null)
+    setHasMorePages(false)
 
     const horizonServer = new Server(network.horizonUrl)
     const rpcServer     = new SorobanRpc.Server(network.rpcUrl)
@@ -144,76 +210,24 @@ function DashboardPageContent() {
           .map(b => ({ code: b.asset_code, issuer: b.asset_issuer, balance: b.balance }))
 
         // Transaction history (fee-payer account)
-        type HorizonOp = {
-          id: string; type: string
-          from?: string; to?: string; funder?: string; account?: string
-          amount?: string; starting_balance?: string
-          asset_type?: string; asset_code?: string; asset_issuer?: string
-          source_amount?: string
-          source_asset_type?: string; source_asset_code?: string
-          created_at: string; transaction_hash: string
-          transaction?: { memo?: string }
-        }
-
-        const payments = await horizonServer
+        const paymentsPage = await horizonServer
           .payments()
           .forAccount(signerPublicKey)
           .limit(20)
           .order('desc')
           .call()
 
-        txRecords = (payments.records as HorizonOp[])
-          .filter(p => p.type === 'payment' || p.type === 'create_account' || p.type === 'path_payment_strict_send')
-          .map(p => {
-            if (p.type === 'create_account') {
-              return {
-                id:           p.id,
-                type:         'received' as const,
-                amount:       p.starting_balance ?? '0',
-                asset:        'XLM',
-                counterparty: p.funder ?? 'Friendbot',
-                timestamp:    Math.floor(new Date(p.created_at).getTime() / 1000),
-                hash:         p.transaction_hash,
-              }
-            }
-            if (p.type === 'path_payment_strict_send') {
-              const srcAsset = p.source_asset_type === 'native' ? 'XLM' : (p.source_asset_code ?? 'XLM')
-              const dstAsset = p.asset_type === 'native' ? 'XLM' : (p.asset_code ?? '')
-              return {
-                id:           p.id,
-                type:         'swapped' as const,
-                amount:       p.source_amount ?? '0',
-                asset:        srcAsset,
-                destAmount:   p.amount ?? '0',
-                destAsset:    dstAsset,
-                counterparty: 'Stellar DEX',
-                timestamp:    Math.floor(new Date(p.created_at).getTime() / 1000),
-                hash:         p.transaction_hash,
-              }
-            }
-            return {
-              id:           p.id,
-              type:         p.from === signerPublicKey ? 'sent' as const : 'received' as const,
-              amount:       p.amount ?? '0',
-              asset:        p.asset_type === 'native' ? 'XLM' : (p.asset_code ?? ''),
-              counterparty: p.from === signerPublicKey ? (p.to ?? '') : (p.from ?? ''),
-              timestamp:    Math.floor(new Date(p.created_at).getTime() / 1000),
-              hash:         p.transaction_hash,
-              memo:         p.transaction?.memo,
-            }
-          })
+        horizonNextRef.current = paymentsPage.records.length >= 20 ? paymentsPage.next : null
+        txRecords = mapHorizonOps(paymentsPage.records as HorizonOp[], signerPublicKey)
       } catch { /* not yet funded */ }
     }
 
     // ── 3. Wraith: incoming SAC transfers to the wallet contract ────────────
     const wraithUrl = process.env.NEXT_PUBLIC_WRAITH_URL
+    let localInCursor: string | null = null
+    let localOutCursor: string | null = null
     if (wraithUrl) {
       try {
-        type WraithTransfer = {
-          id: number; eventType: string; fromAddress: string | null
-          toAddress: string | null; amount: string; ledger: number
-          ledgerClosedAt: string; txHash: string; contractId: string
-        }
         // Incoming: to wallet C... address
         // Outgoing: from fee-payer G... address (sends go from fee-payer, not contract)
         const feePayerAddr = signerPublicKey || walletAddress
@@ -221,8 +235,12 @@ function DashboardPageContent() {
           fetch(`${wraithUrl}/transfers/incoming/${walletAddress}?limit=20`),
           fetch(`${wraithUrl}/transfers/outgoing/${feePayerAddr}?limit=20`),
         ])
-        const inData  = inRes.ok  ? await inRes.json()  as { transfers: WraithTransfer[] } : { transfers: [] }
-        const outData = outRes.ok ? await outRes.json() as { transfers: WraithTransfer[] } : { transfers: [] }
+        const inData  = inRes.ok  ? await inRes.json()  as WraithPage : { transfers: [] as WraithTransfer[], next_cursor: null }
+        const outData = outRes.ok ? await outRes.json() as WraithPage : { transfers: [] as WraithTransfer[], next_cursor: null }
+        localInCursor  = inData.next_cursor  ?? null
+        localOutCursor = outData.next_cursor ?? null
+        setWraithInCursor(localInCursor)
+        setWraithOutCursor(localOutCursor)
 
         const wraithRecords: TxRecord[] = [
           ...inData.transfers.map(t => ({
@@ -279,10 +297,16 @@ function DashboardPageContent() {
       { code: 'XLM', issuer: null, balance: totalXlm },
       ...otherAssets,
     ]
-    cachedAssets       = finalAssets
-    cachedTransactions = txRecords
+    cachedAssets = finalAssets
     setAssets(finalAssets)
-    setTransactions(txRecords)
+
+    // Seed the live feed with history and start streaming from now.
+    // hydrateActivityFeed notifies all subscribers (including useActivityFeed),
+    // so no separate setTransactions call is needed.
+    hydrateActivityFeed(txRecords)
+    if (signerPublicKey) initActivityFeed(signerPublicKey)
+
+    setHasMorePages(horizonNextRef.current !== null || localInCursor !== null || localOutCursor !== null)
     setLoading(false)
   }, [walletAddress])
 
@@ -302,6 +326,75 @@ function DashboardPageContent() {
     document.addEventListener('visibilitychange', onVisible)
     return () => document.removeEventListener('visibilitychange', onVisible)
   }, [fetchData])
+
+  const handleLoadMore = useCallback(async () => {
+    if (!walletAddress) return
+    setIsLoadingMore(true)
+    try {
+      const signerSecret    = sessionStorage.getItem('veil_signer_secret')
+      const signerPublicKey = signerSecret
+        ? Keypair.fromSecret(signerSecret).publicKey()
+        : (localStorage.getItem('veil_signer_public_key') || '')
+
+      const additionalRecords: import('@/components/TxDetailSheet').TxRecord[] = []
+
+      if (horizonNextRef.current) {
+        try {
+          const page = await horizonNextRef.current()
+          additionalRecords.push(...mapHorizonOps(page.records as HorizonOp[], signerPublicKey))
+          horizonNextRef.current = page.records.length >= 20 ? page.next : null
+        } catch { /* Horizon unavailable */ }
+      }
+
+      const wraithUrl = process.env.NEXT_PUBLIC_WRAITH_URL
+      let newInCursor: string | null = null
+      let newOutCursor: string | null = null
+
+      if (wraithUrl && (wraithInCursor || wraithOutCursor)) {
+        try {
+          const feePayerAddr = signerPublicKey || walletAddress
+          const fetches: Promise<Response>[] = []
+          if (wraithInCursor)  fetches.push(fetch(`${wraithUrl}/transfers/incoming/${walletAddress}?limit=20&cursor=${wraithInCursor}`))
+          if (wraithOutCursor) fetches.push(fetch(`${wraithUrl}/transfers/outgoing/${feePayerAddr}?limit=20&cursor=${wraithOutCursor}`))
+          const responses = await Promise.all(fetches)
+          let idx = 0
+
+          if (wraithInCursor) {
+            const res = responses[idx++]
+            const data = res.ok ? await res.json() as WraithPage : { transfers: [] as WraithTransfer[], next_cursor: null }
+            newInCursor = data.next_cursor ?? null
+            additionalRecords.push(...data.transfers.map(t => ({
+              id: `w-${t.id}`, type: 'received' as const,
+              amount: (Math.abs(Number(t.amount)) / 10_000_000).toFixed(7), asset: 'XLM',
+              counterparty: t.fromAddress ?? 'unknown',
+              timestamp: Math.floor(new Date(t.ledgerClosedAt).getTime() / 1000),
+              hash: t.txHash,
+            })))
+          }
+
+          if (wraithOutCursor) {
+            const res = responses[idx++]
+            const data = res.ok ? await res.json() as WraithPage : { transfers: [] as WraithTransfer[], next_cursor: null }
+            newOutCursor = data.next_cursor ?? null
+            additionalRecords.push(...data.transfers.map(t => ({
+              id: `w-${t.id}`, type: 'sent' as const,
+              amount: (Math.abs(Number(t.amount)) / 10_000_000).toFixed(7), asset: 'XLM',
+              counterparty: t.toAddress ?? 'unknown',
+              timestamp: Math.floor(new Date(t.ledgerClosedAt).getTime() / 1000),
+              hash: t.txHash,
+            })))
+          }
+        } catch { /* Wraith unavailable — hide button, keep existing list */ }
+      }
+
+      setWraithInCursor(newInCursor)
+      setWraithOutCursor(newOutCursor)
+      setHasMorePages(horizonNextRef.current !== null || newInCursor !== null || newOutCursor !== null)
+      if (additionalRecords.length > 0) appendActivityFeed(additionalRecords)
+    } finally {
+      setIsLoadingMore(false)
+    }
+  }, [walletAddress, wraithInCursor, wraithOutCursor])
 
   // Fetch live USDC prices from Lens after balances load.
   // Runs in the background — does not block balance rendering and does not
@@ -418,7 +511,9 @@ function DashboardPageContent() {
         if (!keyId || !publicKeyHex) throw new Error('No passkey found. Please register the wallet first.')
 
         const challenge  = payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength) as ArrayBuffer
-        const credIdBin  = atob(keyId.replace(/-/g, '+').replace(/_/g, '/'))
+        const normalized = keyId.replace(/-/g, '+').replace(/_/g, '/')
+        const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4)
+        const credIdBin  = atob(padded)
         const credId     = Uint8Array.from(credIdBin, c => c.charCodeAt(0))
 
         const assertion = await navigator.credentials.get({
@@ -483,7 +578,8 @@ function DashboardPageContent() {
               setCopied(true)
               setTimeout(() => setCopied(false), 2000)
             }}
-            style={{ display: 'flex', alignItems: 'center', gap: '0.375rem', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}
+            className='settings-button'
+            style={{ color: "var(--color-muted)"}}
             title="Copy wallet address"
           >
             <span className="address-chip">
@@ -498,10 +594,13 @@ function DashboardPageContent() {
           </button>
         )}
         <button
+          aria-label='Settings'
           onClick={() => router.push('/settings')}
-          style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '0.25rem', color: 'var(--warm-grey)', display: 'flex' }}
+          className='settings-button'
+          style={{ color: "var(--color-muted)"}}
           title="Settings"
         >
+          
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
             <circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth="1.75"/>
             <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"/>
@@ -542,7 +641,7 @@ function DashboardPageContent() {
               className="btn-gold"
               onClick={handleFund}
               disabled={isFunding}
-              style={{ fontSize: '0.875rem', padding: '0.625rem 1.25rem' }}
+              style={{ fontSize: '0.875rem', padding: '0.625rem 1.25rem', color:'var(--color-muted)', }}
             >
               {isFunding
                 ? <div className="spinner" style={{ width: '14px', height: '14px' }} />
@@ -569,7 +668,7 @@ function DashboardPageContent() {
               </p>
               <button
                 onClick={() => setSweepDismissed(true)}
-                style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'rgba(246,247,248,0.4)', fontSize: '1rem', lineHeight: 1, padding: '0 0 0 0.5rem' }}
+                style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-muted)', fontSize: '1rem', lineHeight: 1, padding: '0 0 0 0.5rem' }}
                 title="Dismiss"
               >
                 ×
@@ -675,6 +774,11 @@ function DashboardPageContent() {
             label="Withdraw"
             onClick={() => router.push('/withdraw')}
             icon={<path d="M12 21V9m0 0l-4 4m4-4l4 4M3 7V5a2 2 0 012-2h14a2 2 0 012 2v2" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>}
+          />
+          <ActionButton
+            label="Vault"
+            onClick={() => router.push('/vault')}
+            icon={<path d="M7 10V7a5 5 0 0110 0v3M5 10h14v10H5V10zm7 4v3" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" fill="none"/>}
           />
         </div>
 
@@ -787,7 +891,7 @@ function DashboardPageContent() {
             </h2>
             <button
               onClick={() => fetchData()}
-              style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'rgba(246,247,248,0.4)', fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.375rem', padding: '0.25rem' }}
+              style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-muted)', fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.375rem', padding: '0.25rem' }}
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
                 <path d="M1 4v6h6M23 20v-6h-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
@@ -898,6 +1002,30 @@ function DashboardPageContent() {
               </div>
             )
           })()}
+
+          {hasMorePages && !loading && (
+            <div style={{ marginTop: '1rem', display: 'flex', justifyContent: 'center' }}>
+              <button
+                onClick={handleLoadMore}
+                disabled={isLoadingMore}
+                style={{
+                  padding: '0.625rem 1.5rem',
+                  borderRadius: '100px',
+                  border: '1px solid rgba(246,247,248,0.2)',
+                  background: 'transparent',
+                  color: 'rgba(246,247,248,0.6)',
+                  fontSize: '0.8125rem',
+                  cursor: isLoadingMore ? 'default' : 'pointer',
+                  display: 'flex', alignItems: 'center', gap: '0.5rem',
+                  transition: 'all 120ms',
+                }}
+              >
+                {isLoadingMore
+                  ? <div className="spinner" style={{ width: '14px', height: '14px' }} />
+                  : 'Load more'}
+              </button>
+            </div>
+          )}
         </section>
 
       </main>
